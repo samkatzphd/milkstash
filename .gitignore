@@ -1,0 +1,9 @@
+# Never commit anyone's personal milk log
+*.csv
+settings.json
+report.html
+.milkstash/
+
+__pycache__/
+*.pyc
+.DS_Store
