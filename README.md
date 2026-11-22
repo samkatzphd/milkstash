@@ -50,6 +50,7 @@ The menu does everything, or you can type commands directly:
 | Use the oldest bag | `python3 milkstash.py use` |
 | See which bags are extra | `python3 milkstash.py plan` |
 | Mark the extra bags as donated | `python3 milkstash.py donate` |
+| Find milk for a 120-day-old baby | `python3 milkstash.py match 120` |
 | Throw away bag 12 | `python3 milkstash.py toss 12` |
 | Undo a change to bag 12 | `python3 milkstash.py restore 12` |
 | Make a page with a chart | `python3 milkstash.py report` |
@@ -62,10 +63,11 @@ Run `python3 milkstash.py report` to open a page with your numbers and chart. Th
 
 ![Sample Milk Stash report with summary numbers, a chart of the stash over time against a 90-day goal, a daily milk chart with a 4-day average, and a list of the bags to use first](docs/report.png)
 
-- **Summary numbers** show what's in the freezer, how many days it will last, how much is ready to donate, and how much you've donated so far.
+- **Milk donated** celebrates your total in ounces, bags, gallons, and days of milk for babies who need it. Donating is a big deal, so it gets top billing.
+- **Summary numbers** show what's in the freezer, how many days it will last, and how much is ready to donate.
 - **Stash over time** tracks your supply against your goal, shown as the dashed line. Each sharp drop in this example is a donation that brings the stash back down to the goal.
 - **Daily milk** shows what you pumped each day above the line and what was used, donated, or tossed below it. The dark line is your 4-day pumping average, which makes trends easier to see.
-- **Use these first** lists the 10 oldest in-date bags with their bag numbers and use-by dates.
+- **Use these first** lists the 10 oldest in-date bags with their bag numbers, days post delivery, and use-by dates.
 
 Add your baby's birthday to count both charts in days since delivery. Without it, they show calendar months:
 
@@ -74,6 +76,16 @@ python3 milkstash.py settings --birth-date 3/14/2026
 ```
 
 The report is saved on your computer and works in light or dark mode.
+
+## Match milk to a baby's age
+
+Milk changes as a baby grows, so some families like to give milk pumped around the baby's current age. Once you've set a birthday, every bag shows its **days post delivery**, and `match` finds the closest in-date bags:
+
+```
+python3 milkstash.py match        # closest to your baby's age today
+python3 milkstash.py match 120    # closest to day 120
+python3 milkstash.py match 120 --within 7
+```
 
 ## Set your own goal
 
@@ -94,6 +106,21 @@ python3 milkstash.py settings --target-days 60 --daily-oz 20
 
 Milk Stash adds up your in-date bags and subtracts your goal. It then suggests the oldest whole bags that fit in the extra, so your freshest milk stays home and you never drop below your goal.
 
+## Prefer logging in Airtable?
+
+Airtable is handy for logging from your phone at the freezer. Milk Stash has a free template that feeds straight into the script.
+
+1. Open the [Milk Stash Airtable template](https://airtable.com/appTWPeo4eDgP1huM/shraOW8tDMybrMWl8) and choose **Copy base**. Your copy is private to you.
+2. In your copy, open the **Days Post Delivery** field's formula and replace `BIRTHDAY` with your baby's birthday, written like `2026-03-14`.
+3. Add a row for each bag. Check **Used**, **Donated**, or **Tossed** when it leaves the freezer, and add the date.
+4. When you want your charts, use the view menu to **Download CSV**, then run:
+
+```
+python3 milkstash.py import "Bags-All bags.csv" --replace
+```
+
+Use your downloaded file's name. `--replace` updates Milk Stash to match Airtable and keeps your previous version as `stash.backup.csv`. Treat Airtable as your main record once you start this way, because changes made only in the script are replaced on the next import.
+
 ## Already keeping a spreadsheet?
 
 Export it as a CSV and run:
@@ -102,7 +129,7 @@ Export it as a CSV and run:
 python3 milkstash.py import my-log.csv
 ```
 
-The file needs a `Date` column and a `Volume (ml)` or `Volume (oz)` column. Optional columns are `Name`, `Used`, `Donated`, `Donation date`, and `Special notes`. Spreadsheets rarely record when a bag was used, so imported used bags are counted on the day they were pumped.
+The file needs a `Date` column and a `Volume (ml)` or `Volume (oz)` column. If it has both, Milk Stash uses oz. Optional columns are `Bag`, `Days Post Delivery`, `Used`, `Used date`, `Donated`, `Donation date`, `Tossed`, `Tossed date`, and `Special notes`. A used or tossed bag with no date is counted on the day it was pumped.
 
 ## Where your data lives
 

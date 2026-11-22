@@ -18,6 +18,7 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
 import tempfile
 import webbrowser
@@ -98,7 +99,7 @@ def save_bags(bags):
             writer.writerow({
                 "id": bag["id"],
                 "pumped": bag["pumped"].isoformat(),
-                "volume_ml": f"{bag['volume_ml']:.1f}",
+                "volume_ml": f"{bag['volume_ml']:.2f}",
                 "status": bag["status"],
                 "status_date": (bag["status_date"].isoformat()
                                 if bag["status_date"] else ""),
@@ -214,12 +215,84 @@ def at_risk(bags, settings, today=None):
 
 # ---------------------------------------------------------------- commands
 
+def days_post_delivery(bag, settings):
+    """How many days after delivery this milk was pumped, if we know the birthday."""
+    birth = settings.get("birth_date")
+    return (bag["pumped"] - date.fromisoformat(birth)).days if birth else None
+
+
+def day_label(bag, settings):
+    day = days_post_delivery(bag, settings)
+    return "-" if day is None else str(day)
+
+
 def show_bags(bags, settings):
-    print(f"  {'Bag':>5}  {'Pumped':<13} {'Amount':>10}  {'Use by':<13} Notes")
+    print(f"  {'Bag':>5}  {'Pumped':<13} {'Day':>5} {'Amount':>10}  {'Use by':<13} Notes")
     for bag in bags:
         print(f"  {bag['id']:>5}  {nice(bag['pumped']):<13} "
+              f"{day_label(bag, settings):>5} "
               f"{fmt(bag['volume_ml'], settings):>10}  "
               f"{nice(use_by(bag, settings)):<13} {bag['notes']}")
+
+
+def donation_stats(bags, settings):
+    donated = [b for b in bags if b["status"] == "donated"]
+    ml = sum(b["volume_ml"] for b in donated)
+    return {"bags": len(donated), "ml": ml, "days": ml / daily_ml(settings)}
+
+
+def whole_amount(ml, settings):
+    if settings["unit"] == "ml":
+        return f"{ml:,.0f} ml"
+    return f"{ml / ML_PER_OZ:,.0f} oz"
+
+
+def big_measure(ml, settings):
+    if settings["unit"] == "ml":
+        return f"{ml / 1000:,.1f}", "liters"
+    return f"{ml / ML_PER_OZ / 128:,.1f}", "gallons"
+
+
+def print_celebration(bags, settings):
+    stats = donation_stats(bags, settings)
+    if not stats["bags"]:
+        return
+    amount, name = big_measure(stats["ml"], settings)
+    print("  " + "* " * 21)
+    print(f"  THANK YOU! You've donated {whole_amount(stats['ml'], settings)} of milk.")
+    print(f"  That's {stats['bags']} bags and {amount} {name}, or about "
+          f"{stats['days']:.0f} days of milk")
+    print("  for babies who need it.")
+    print("  " + "* " * 21)
+    print()
+
+
+def cmd_match(args):
+    """Find the bags pumped closest to a baby's age."""
+    settings, bags = load_settings(), load_bags()
+    birth = settings.get("birth_date")
+    if not birth:
+        raise ValueError("Add your baby's birthday first: "
+                         "settings --birth-date 3/14/2026")
+    age = args.age
+    if age is None:
+        age = (date.today() - date.fromisoformat(birth)).days
+    if age < 0:
+        raise ValueError("The baby's age can't be negative.")
+    good = good_bags(bags, settings)
+    close = [b for b in good
+             if abs(days_post_delivery(b, settings) - age) <= args.within]
+    close.sort(key=lambda b: (abs(days_post_delivery(b, settings) - age),
+                              b["pumped"], b["id"]))
+    if not close:
+        print(f"No in-date bags were pumped within {args.within} days of day {age}.")
+        return
+    print(f"Closest in-date bags for a baby {age} days old:\n")
+    shown = close[:args.limit]
+    show_bags(shown, settings)
+    total = sum(b["volume_ml"] for b in close)
+    print(f"\n  Showing {len(shown)} of {len(close)} bags within {args.within} days "
+          f"({fmt(total, settings)} in all).")
 
 
 def cmd_status(_args=None):
@@ -248,6 +321,7 @@ def cmd_status(_args=None):
     plan = donation_plan(bags, settings, today)
 
     print()
+    print_celebration(bags, settings)
     if expired:
         print(f"  ! {len(expired)} bags are past their use-by date. "
               "See them with: list --expired")
@@ -335,6 +409,8 @@ def cmd_donate(args):
                 print("No changes made.")
                 return
     change_status(ids, "donated", parse_date(args.date), "Donated")
+    print()
+    print_celebration(load_bags(), load_settings())
 
 
 def cmd_toss(args):
@@ -401,12 +477,18 @@ def cmd_settings(args):
 
 
 def cmd_import(args):
+    if args.append and args.replace:
+        raise ValueError("Choose either --append or --replace, not both.")
     bags = load_bags()
-    if bags and not args.append:
-        raise ValueError("You already have bags saved. To add this file to "
-                         "them anyway, run import again with --append.")
+    if bags and not (args.append or args.replace):
+        raise ValueError("You already have bags saved. Use --replace to update "
+                         "them from this file (a backup is kept), or --append "
+                         "to add to them.")
+    if args.replace:
+        bags = []
     used_ids = {b["id"] for b in bags}
     added = skipped = 0
+    births = {}
     with open(args.file, newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         columns = {re.sub(r"[^a-z]", "", (c or "").lower()): c
@@ -417,26 +499,39 @@ def cmd_import(args):
         if not date_col or not (ml_col or oz_col):
             raise ValueError("The file needs a Date column and a "
                              "'Volume (ml)' or 'Volume (oz)' column.")
-        flag = lambda row, name: bool((row.get(columns.get(name, ""), "")
-                                       or "").strip())
+        days_col = columns.get("dayspostdelivery")
+        cell = lambda row, name: (row.get(columns.get(name, ""), "") or "").strip()
+        left_on = lambda row, name, pumped: (parse_date(cell(row, name))
+                                             if cell(row, name) else pumped)
         for row in reader:
+            if not (row.get(date_col) or "").strip():
+                skipped += any((v or "").strip() for v in row.values()
+                               if isinstance(v, str))
+                continue
             try:
                 pumped = parse_date(row[date_col])
-                if ml_col and (row.get(ml_col) or "").strip():
-                    volume = float(row[ml_col])
-                else:
+                # Prefer oz: spreadsheets often subtract the bag's weight there.
+                if oz_col and (row.get(oz_col) or "").strip():
                     volume = float(row[oz_col]) * ML_PER_OZ
-            except (ValueError, TypeError):
+                else:
+                    volume = float(row[ml_col])
+                if not math.isfinite(volume) or volume <= 0:
+                    raise ValueError
+            except (ValueError, TypeError, KeyError):
                 skipped += 1
                 continue
+            day_text = (row.get(days_col) or "").strip() if days_col else ""
+            if re.fullmatch(r"-?\d+", day_text):
+                born = pumped - timedelta(days=int(day_text))
+                births[born] = births.get(born, 0) + 1
             status, when = "stored", None
-            if flag(row, "donated"):
-                status = "donated"
-                raw = row.get(columns.get("donationdate", ""), "")
-                when = parse_date(raw) if (raw or "").strip() else pumped
-            elif flag(row, "used"):
-                status, when = "used", pumped
-            label = (row.get(columns.get("name", ""), "") or "").strip()
+            if cell(row, "donated"):
+                status, when = "donated", left_on(row, "donationdate", pumped)
+            elif cell(row, "used"):
+                status, when = "used", left_on(row, "useddate", pumped)
+            elif cell(row, "tossed"):
+                status, when = "discarded", left_on(row, "tosseddate", pumped)
+            label = cell(row, "name") or cell(row, "bag")
             bag_id = int(label) if label.isdigit() else 0
             if not bag_id or bag_id in used_ids:
                 bag_id = max(used_ids, default=0) + 1
@@ -446,9 +541,20 @@ def cmd_import(args):
             bags.append({"id": bag_id, "pumped": pumped, "volume_ml": volume,
                          "status": status, "status_date": when, "notes": notes})
             added += 1
+    if not added:
+        raise ValueError("I couldn't find any bags in that file, so nothing changed.")
+    stash = home() / "stash.csv"
+    if args.replace and stash.exists():
+        shutil.copy2(stash, home() / "stash.backup.csv")
     save_bags(bags)
     print(f"Imported {added} bags." +
           (f" Skipped {skipped} rows I couldn't read." if skipped else ""))
+    settings = load_settings()
+    if births and not settings.get("birth_date"):
+        settings["birth_date"] = max(births, key=births.get).isoformat()
+        save_settings(settings)
+        print("Set your baby's birthday from the file: "
+              f"{nice(date.fromisoformat(settings['birth_date']))}.")
 
 
 def history(bags, settings):
@@ -616,20 +722,37 @@ def cmd_report(args):
         raise ValueError("Add a bag first, then I can draw your report.")
     good = good_bags(bags, settings)
     total = sum(b["volume_ml"] for b in good)
-    donated = sum(b["volume_ml"] for b in bags if b["status"] == "donated")
+    stats = donation_stats(bags, settings)
     plan = donation_plan(bags, settings)
+    hero = ""
+    if stats["bags"]:
+        amount, measure = big_measure(stats["ml"], settings)
+        hero = (
+            '<section class=hero><span class="h1" aria-hidden=true>&hearts;</span>'
+            '<span class="h2" aria-hidden=true>&hearts;</span>'
+            '<span class="h3" aria-hidden=true>&hearts;</span>'
+            '<div class=kick>Milk donated</div>'
+            f'<div class=big>{whole_amount(stats["ml"], settings)}</div>'
+            f'<p>That\'s about <b>{stats["days"]:,.0f} days of milk</b> for babies '
+            'who need it. Thank you.</p><div class=wins>'
+            f'<div><b>{stats["bags"]:,}</b><span>bags donated</span></div>'
+            f'<div><b>{amount}</b><span>{measure}</span></div>'
+            f'<div><b>{stats["days"]:,.0f}</b><span>days of milk</span></div>'
+            '</div></section>')
     rows = "".join(
         f"<tr><td>#{b['id']}</td><td>{nice(b['pumped'])}</td>"
+        f"<td>{day_label(b, settings)}</td>"
         f"<td>{fmt(b['volume_ml'], settings)}</td>"
         f"<td>{nice(use_by(b, settings))}</td>"
         f"<td>{html.escape(b['notes'])}</td></tr>" for b in good[:10])
-    table = ("<table><tr><th>Bag<th>Pumped<th>Amount<th>Use by<th>Notes</tr>"
+    table = ("<table><tr><th>Bag<th>Pumped<th>Days post delivery<th>Amount"
+             "<th>Use by<th>Notes</tr>"
              f"{rows}</table>" if rows else
              "<p>There are no in-date bags in the freezer right now.</p>")
     tiles = [("In the freezer", fmt(total, settings)),
              ("Days of milk", f"{total / daily_ml(settings):.0f}"),
              ("Ready to donate", fmt(sum(b["volume_ml"] for b in plan), settings)),
-             ("Donated so far", fmt(donated, settings))]
+             ("Bags in the freezer", f"{len(good):,}")]
     tile_html = "".join(f"<div class=tile><b>{v}</b><span>{k}</span></div>"
                         for k, v in tiles)
     page = f"""<!doctype html><html lang=en><meta charset=utf-8>
@@ -647,9 +770,13 @@ body{{margin:0 auto;max-width:800px;padding:24px 16px;background:var(--bg);color
 rect.pumped{{fill:var(--pumped)}}rect.used{{fill:var(--used)}}rect.donated{{fill:var(--donated)}}rect.discarded{{fill:var(--tossed)}}
 .legend{{display:flex;flex-wrap:wrap;gap:6px 16px;margin-bottom:8px;color:var(--soft);font-size:14px}}.legend span{{display:inline-flex;align-items:center;gap:6px}}
 .legend i{{width:12px;height:12px;border-radius:3px}}i.pumped{{background:var(--pumped)}}i.used{{background:var(--used)}}i.donated{{background:var(--donated)}}i.discarded{{background:var(--tossed)}}.legend i.avgkey{{height:2px;width:18px;border-radius:0;background:var(--ink)}}
+.hero{{position:relative;overflow:hidden;margin-bottom:14px;padding:30px 24px;border-radius:16px;text-align:center;color:#fff;background:linear-gradient(135deg,#6b3fa0,#b04a82 60%,#d9694f)}}
+.hero>*{{position:relative}}.hero .kick{{font-size:14px;font-weight:700;letter-spacing:.09em;text-transform:uppercase}}.hero .big{{font-size:clamp(46px,12vw,76px);font-weight:800;line-height:1.08;margin:4px 0}}.hero p{{margin:0 auto 18px;max-width:480px;font-size:18px}}
+.wins{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:520px;margin:auto}}.wins div{{padding:10px 4px;border-radius:10px;background:rgba(40,12,50,.28)}}.wins b{{display:block;font-size:22px}}.wins span{{font-size:13px}}
+.hero .h1,.hero .h2,.hero .h3{{position:absolute;color:#fff;opacity:.16;line-height:1}}.h1{{font-size:96px;left:14px;top:2px}}.h2{{font-size:62px;right:24px;top:14px}}.h3{{font-size:78px;right:8%;bottom:-8px}}
 table{{border-collapse:collapse;width:100%}}
 td,th{{padding:6px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}}h2{{font-size:17px;margin:0 0 10px}}
-</style><h1>Milk Stash</h1><div class=tiles>{tile_html}</div>
+</style><h1>Milk Stash</h1>{hero}<div class=tiles>{tile_html}</div>
 <div class=card><h2>Stash over time ({settings['unit']})</h2>{chart_svg(history(bags, settings), settings)}</div>
 <div class=card><h2>Daily milk ({settings['unit']})</h2>{daily_legend(bags)}{daily_svg(bags, settings)}</div>
 <div class=card><h2>Use these first</h2>{table}</div>
@@ -713,7 +840,8 @@ def menu():
     while True:
         cmd_status()
         print("  1 Add milk      2 Use a bag     3 Donate extra")
-        print("  4 See bags      5 Open report   6 Settings    q Quit")
+        print("  4 See bags      5 Open report   6 Settings")
+        print("  7 Match to a baby's age         q Quit")
         choice = input("\nWhat would you like to do? ").strip().lower()
         try:
             if choice == "1":
@@ -737,6 +865,9 @@ def menu():
                 current["birth_date"] = parse_birth_date(
                     ask("Baby's birthday (or none)", current.get("birth_date") or "none"))
                 save_settings(current)
+            elif choice == "7":
+                raw = ask("Baby's age in days (Enter for your baby's age today)")
+                cmd_match(ns(age=int(raw) if raw else None, within=14, limit=10))
             elif choice in ("q", "quit", "exit"):
                 return
         except ValueError as error:
@@ -766,6 +897,13 @@ def build_parser():
     p.set_defaults(func=cmd_use)
 
     sub.add_parser("plan", help="see which bags are extra").set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("match", help="find milk pumped closest to a baby's age")
+    p.add_argument("age", nargs="?", type=int,
+                   help="age in days (your baby's age today if left out)")
+    p.add_argument("--within", type=int, default=14, help="days either side")
+    p.add_argument("--limit", type=int, default=10, help="most bags to show")
+    p.set_defaults(func=cmd_match)
 
     p = sub.add_parser("donate", help="mark bags donated (the plan if none given)")
     p.add_argument("ids", nargs="*", type=int)
@@ -804,6 +942,8 @@ def build_parser():
     p.add_argument("file")
     p.add_argument("--append", action="store_true",
                    help="add to the bags you already have")
+    p.add_argument("--replace", action="store_true",
+                   help="update your stash from this file, keeping a backup")
     p.set_defaults(func=cmd_import)
 
     sub.add_parser("demo", help="try it with made-up data").set_defaults(func=cmd_demo)
