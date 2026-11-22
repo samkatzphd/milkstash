@@ -56,6 +56,18 @@ The menu does everything, or you can type commands directly:
 
 Each new bag gets a number. Write it on the bag so you can find it later.
 
+## Your report
+
+Run `python3 milkstash.py report` to open a page with your numbers and chart. This example uses made-up data:
+
+![Sample Milk Stash report with summary numbers, a chart of the stash over time against a 90-day goal, and a list of the bags to use first](docs/report.png)
+
+- **Summary numbers** show what's in the freezer, how many days it will last, how much is ready to donate, and how much you've donated so far.
+- **Stash over time** tracks your supply against your goal, shown as the dashed line. Each sharp drop in this example is a donation that brings the stash back down to the goal.
+- **Use these first** lists the 10 oldest in-date bags with their bag numbers and use-by dates.
+
+The report is saved on your computer and works in light or dark mode.
+
 ## Set your own goal
 
 ```
