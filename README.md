@@ -50,6 +50,7 @@ The menu does everything, or you can type commands directly:
 | Use the oldest bag | `python3 milkstash.py use` |
 | See which bags are extra | `python3 milkstash.py plan` |
 | Mark the extra bags as donated | `python3 milkstash.py donate` |
+| Log a donation without bag details | `python3 milkstash.py bulk 50 --date 7/7/2026` |
 | Find milk for a 120-day-old baby | `python3 milkstash.py match 120` |
 | Throw away bag 12 | `python3 milkstash.py toss 12` |
 | Undo a change to bag 12 | `python3 milkstash.py restore 12` |
@@ -106,6 +107,19 @@ python3 milkstash.py settings --target-days 60 --daily-oz 20
 
 Milk Stash adds up your in-date bags and subtracts your goal. It then suggests the oldest whole bags that fit in the extra, so your freshest milk stays home and you never drop below your goal.
 
+## Donations without bag details
+
+Sometimes other people help get milk to a donation site, and all you hear back is the total. That milk still counts. A bulk donation needs only an amount:
+
+```
+python3 milkstash.py bulk 50 --date 7/7/2026 --note "Grandma's drop-off"
+python3 milkstash.py bulk 1500ml --date unknown
+python3 milkstash.py bulk              # see them all
+python3 milkstash.py bulk --remove 2   # undo one
+```
+
+Bulk donations add to your celebration total and appear on the daily chart when they have a date. They don't change your freezer stash, so if those bags are in Milk Stash, mark them with `donate` instead to avoid counting them twice.
+
 ## Prefer logging in Airtable?
 
 Airtable is handy for logging from your phone at the freezer. Milk Stash has a free template that feeds straight into the script.
@@ -119,7 +133,13 @@ Airtable is handy for logging from your phone at the freezer. Milk Stash has a f
 python3 milkstash.py import "Bags-All bags.csv" --replace
 ```
 
-Use your downloaded file's name. `--replace` updates Milk Stash to match Airtable and keeps your previous version as `stash.backup.csv`. Treat Airtable as your main record once you start this way, because changes made only in the script are replaced on the next import.
+If you use the template's **Bulk donations** table, download it too and run:
+
+```
+python3 milkstash.py import "Bulk donations-Grid view.csv" --bulk --replace
+```
+
+Use your downloaded files' names. `--replace` updates Milk Stash to match Airtable and keeps your previous version as `stash.backup.csv`. Treat Airtable as your main record once you start this way, because changes made only in the script are replaced on the next import.
 
 ## Already keeping a spreadsheet?
 

@@ -27,6 +27,7 @@ from pathlib import Path
 
 ML_PER_OZ = 29.5735
 FIELDS = ["id", "pumped", "volume_ml", "status", "status_date", "notes"]
+BULK_FIELDS = ["id", "date", "volume_ml", "notes"]
 DEFAULTS = {
     "unit": "oz",            # "oz" or "ml"
     "daily_oz": 24.0,        # how much milk baby drinks per day
@@ -106,6 +107,31 @@ def save_bags(bags):
                 "notes": bag["notes"],
             })
     atomic_write(home() / "stash.csv", write)
+
+
+def load_bulk():
+    """Donations recorded as a total, without bag-by-bag details."""
+    path = home() / "bulk_donations.csv"
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as handle:
+        return [{"id": int(row["id"]),
+                 "date": date.fromisoformat(row["date"]) if row.get("date") else None,
+                 "volume_ml": float(row["volume_ml"]),
+                 "notes": row.get("notes") or ""}
+                for row in csv.DictReader(handle)]
+
+
+def save_bulk(rows):
+    def write(handle):
+        writer = csv.DictWriter(handle, fieldnames=BULK_FIELDS)
+        writer.writeheader()
+        for row in sorted(rows, key=lambda r: r["id"]):
+            writer.writerow({"id": row["id"],
+                             "date": row["date"].isoformat() if row["date"] else "",
+                             "volume_ml": f"{row['volume_ml']:.2f}",
+                             "notes": row["notes"]})
+    atomic_write(home() / "bulk_donations.csv", write)
 
 
 # ---------------------------------------------------------------- parsing
@@ -237,8 +263,19 @@ def show_bags(bags, settings):
 
 def donation_stats(bags, settings):
     donated = [b for b in bags if b["status"] == "donated"]
-    ml = sum(b["volume_ml"] for b in donated)
-    return {"bags": len(donated), "ml": ml, "days": ml / daily_ml(settings)}
+    bulk = load_bulk()
+    bulk_ml = sum(r["volume_ml"] for r in bulk)
+    ml = sum(b["volume_ml"] for b in donated) + bulk_ml
+    return {"bags": len(donated), "ml": ml, "days": ml / daily_ml(settings),
+            "bulk_ml": bulk_ml, "bulk_count": len(bulk)}
+
+
+def bulk_note(stats, settings):
+    if not stats["bulk_count"]:
+        return ""
+    plural = "donation" if stats["bulk_count"] == 1 else "donations"
+    return (f"Includes {whole_amount(stats['bulk_ml'], settings)} from "
+            f"{stats['bulk_count']} bulk {plural}.")
 
 
 def whole_amount(ml, settings):
@@ -255,14 +292,15 @@ def big_measure(ml, settings):
 
 def print_celebration(bags, settings):
     stats = donation_stats(bags, settings)
-    if not stats["bags"]:
+    if not stats["ml"]:
         return
     amount, name = big_measure(stats["ml"], settings)
     print("  " + "* " * 21)
     print(f"  THANK YOU! You've donated {whole_amount(stats['ml'], settings)} of milk.")
-    print(f"  That's {stats['bags']} bags and {amount} {name}, or about "
-          f"{stats['days']:.0f} days of milk")
+    print(f"  That's {amount} {name}, or about {stats['days']:.0f} days of milk")
     print("  for babies who need it.")
+    if stats["bulk_count"]:
+        print(f"  {bulk_note(stats, settings)}")
     print("  " + "* " * 21)
     print()
 
@@ -413,6 +451,39 @@ def cmd_donate(args):
     print_celebration(load_bags(), load_settings())
 
 
+def cmd_bulk(args):
+    """Record, list, or remove a donation that isn't tied to specific bags."""
+    settings, rows = load_settings(), load_bulk()
+    if args.remove is not None:
+        if args.remove not in {r["id"] for r in rows}:
+            raise ValueError(f"No bulk donation numbered {args.remove}.")
+        save_bulk([r for r in rows if r["id"] != args.remove])
+        print(f"Removed bulk donation {args.remove}.")
+        return
+    if not args.amount:
+        if not rows:
+            print("No bulk donations yet. Add one with: bulk 50 --date 7/7/2026")
+            return
+        print(f"  {'#':>3}  {'Date':<13} {'Amount':>10}  Notes")
+        for row in sorted(rows, key=lambda r: (r["date"] or date.max, r["id"])):
+            when = nice(row["date"]) if row["date"] else "unknown"
+            print(f"  {row['id']:>3}  {when:<13} "
+                  f"{fmt(row['volume_ml'], settings):>10}  {row['notes']}")
+        print(f"\n  Total: {fmt(sum(r['volume_ml'] for r in rows), settings)}")
+        return
+    volume = parse_volume(args.amount, settings["unit"])
+    when = None if args.date.strip().lower() == "unknown" else parse_date(args.date)
+    if when and when > date.today():
+        raise ValueError("That date is in the future.")
+    next_id = max((r["id"] for r in rows), default=0) + 1
+    rows.append({"id": next_id, "date": when, "volume_ml": volume,
+                 "notes": args.note or ""})
+    save_bulk(rows)
+    print(f"Logged bulk donation {next_id}: {fmt(volume, settings)}. "
+          "Your freezer stash didn't change.\n")
+    print_celebration(load_bags(), settings)
+
+
 def cmd_toss(args):
     change_status(args.ids, "discarded", parse_date(args.date), "Discarded")
 
@@ -476,9 +547,63 @@ def cmd_settings(args):
     print(f"  Baby's birthday {nice(date.fromisoformat(birth)) if birth else 'not set'}")
 
 
+def import_bulk(args):
+    rows = load_bulk()
+    if rows and not (args.append or args.replace):
+        raise ValueError("You already have bulk donations saved. Use --replace "
+                         "to update them from this file (a backup is kept), or "
+                         "--append to add to them.")
+    if args.replace:
+        rows = []
+    next_id = max((r["id"] for r in rows), default=0) + 1
+    added = skipped = 0
+    with open(args.file, newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        columns = {re.sub(r"[^a-z]", "", (c or "").lower()): c
+                   for c in reader.fieldnames or []}
+        date_col = columns.get("date")
+        ml_col = columns.get("volumeml") or columns.get("ml")
+        oz_col = columns.get("volumeoz") or columns.get("oz")
+        notes_col = columns.get("notes") or columns.get("specialnotes")
+        if not (ml_col or oz_col):
+            raise ValueError("The file needs a 'Volume (ml)' or 'Volume (oz)' column.")
+        for row in reader:
+            oz_text = (row.get(oz_col) or "").strip() if oz_col else ""
+            ml_text = (row.get(ml_col) or "").strip() if ml_col else ""
+            if not (oz_text or ml_text):
+                skipped += any((v or "").strip() for v in row.values()
+                               if isinstance(v, str))
+                continue
+            try:
+                volume = float(oz_text) * ML_PER_OZ if oz_text else float(ml_text)
+                if not math.isfinite(volume) or volume <= 0:
+                    raise ValueError
+                date_text = (row.get(date_col) or "").strip() if date_col else ""
+                when = parse_date(date_text) if date_text else None
+            except ValueError:
+                skipped += 1
+                continue
+            notes = (row.get(notes_col) or "").strip() if notes_col else ""
+            rows.append({"id": next_id, "date": when, "volume_ml": volume,
+                         "notes": notes})
+            next_id += 1
+            added += 1
+    if not added:
+        raise ValueError("I couldn't find any donations in that file, so nothing changed.")
+    path = home() / "bulk_donations.csv"
+    if args.replace and path.exists():
+        shutil.copy2(path, home() / "bulk_donations.backup.csv")
+    save_bulk(rows)
+    print(f"Imported {added} bulk donations." +
+          (f" Skipped {skipped} rows I couldn't read." if skipped else ""))
+
+
 def cmd_import(args):
     if args.append and args.replace:
         raise ValueError("Choose either --append or --replace, not both.")
+    if args.bulk:
+        import_bulk(args)
+        return
     bags = load_bags()
     if bags and not (args.append or args.replace):
         raise ValueError("You already have bags saved. Use --replace to update "
@@ -665,6 +790,10 @@ def daily_totals(bags):
         if bag["status"] != "stored" and bag["status_date"]:
             day = totals.setdefault(bag["status_date"], {})
             day[bag["status"]] = day.get(bag["status"], 0) + bag["volume_ml"]
+    for row in load_bulk():
+        if row["date"]:
+            day = totals.setdefault(row["date"], {})
+            day["donated"] = day.get("donated", 0) + row["volume_ml"]
     return totals
 
 
@@ -672,7 +801,8 @@ def daily_svg(bags, settings):
     """Bars for milk in (up) and out (down), with a rolling average of pumping."""
     divisor = unit_size(settings)
     totals = daily_totals(bags)
-    start, end = min(totals), max(max(totals), history(bags, settings)[-1][0])
+    points = history(bags, settings)
+    start, end = min(totals), max([max(totals)] + [p[0] for p in points[-1:]])
     days = [start + timedelta(days=n) for n in range((end - start).days + 1)]
     outgoing = ("used", "donated", "discarded")
     high = max(t.get("pumped", 0) for t in totals.values()) / divisor
@@ -718,15 +848,17 @@ def daily_legend(bags):
 
 def cmd_report(args):
     settings, bags = load_settings(), load_bags()
-    if not bags:
+    if not bags and not load_bulk():
         raise ValueError("Add a bag first, then I can draw your report.")
     good = good_bags(bags, settings)
     total = sum(b["volume_ml"] for b in good)
     stats = donation_stats(bags, settings)
     plan = donation_plan(bags, settings)
     hero = ""
-    if stats["bags"]:
+    if stats["ml"]:
         amount, measure = big_measure(stats["ml"], settings)
+        note = bulk_note(stats, settings)
+        note_html = f"<div class=bulknote>{note}</div>" if note else ""
         hero = (
             '<section class=hero><span class="h1" aria-hidden=true>&hearts;</span>'
             '<span class="h2" aria-hidden=true>&hearts;</span>'
@@ -738,7 +870,7 @@ def cmd_report(args):
             f'<div><b>{stats["bags"]:,}</b><span>bags donated</span></div>'
             f'<div><b>{amount}</b><span>{measure}</span></div>'
             f'<div><b>{stats["days"]:,.0f}</b><span>days of milk</span></div>'
-            '</div></section>')
+            f'</div>{note_html}</section>')
     rows = "".join(
         f"<tr><td>#{b['id']}</td><td>{nice(b['pumped'])}</td>"
         f"<td>{day_label(b, settings)}</td>"
@@ -755,6 +887,13 @@ def cmd_report(args):
              ("Bags in the freezer", f"{len(good):,}")]
     tile_html = "".join(f"<div class=tile><b>{v}</b><span>{k}</span></div>"
                         for k, v in tiles)
+    charts = ""
+    if bags:
+        charts += (f"<div class=card><h2>Stash over time ({settings['unit']})</h2>"
+                   f"{chart_svg(history(bags, settings), settings)}</div>")
+    if daily_totals(bags):
+        charts += (f"<div class=card><h2>Daily milk ({settings['unit']})</h2>"
+                   f"{daily_legend(bags)}{daily_svg(bags, settings)}</div>")
     page = f"""<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Milk Stash</title><style>
@@ -773,12 +912,11 @@ rect.pumped{{fill:var(--pumped)}}rect.used{{fill:var(--used)}}rect.donated{{fill
 .hero{{position:relative;overflow:hidden;margin-bottom:14px;padding:30px 24px;border-radius:16px;text-align:center;color:#fff;background:linear-gradient(135deg,#6b3fa0,#b04a82 60%,#d9694f)}}
 .hero>*{{position:relative}}.hero .kick{{font-size:14px;font-weight:700;letter-spacing:.09em;text-transform:uppercase}}.hero .big{{font-size:clamp(46px,12vw,76px);font-weight:800;line-height:1.08;margin:4px 0}}.hero p{{margin:0 auto 18px;max-width:480px;font-size:18px}}
 .wins{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:520px;margin:auto}}.wins div{{padding:10px 4px;border-radius:10px;background:rgba(40,12,50,.28)}}.wins b{{display:block;font-size:22px}}.wins span{{font-size:13px}}
-.hero .h1,.hero .h2,.hero .h3{{position:absolute;color:#fff;opacity:.16;line-height:1}}.h1{{font-size:96px;left:14px;top:2px}}.h2{{font-size:62px;right:24px;top:14px}}.h3{{font-size:78px;right:8%;bottom:-8px}}
+.bulknote{{margin-top:12px;font-size:14px}}.hero .h1,.hero .h2,.hero .h3{{position:absolute;color:#fff;opacity:.16;line-height:1}}.h1{{font-size:96px;left:14px;top:2px}}.h2{{font-size:62px;right:24px;top:14px}}.h3{{font-size:78px;right:8%;bottom:-8px}}
 table{{border-collapse:collapse;width:100%}}
 td,th{{padding:6px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}}h2{{font-size:17px;margin:0 0 10px}}
 </style><h1>Milk Stash</h1>{hero}<div class=tiles>{tile_html}</div>
-<div class=card><h2>Stash over time ({settings['unit']})</h2>{chart_svg(history(bags, settings), settings)}</div>
-<div class=card><h2>Daily milk ({settings['unit']})</h2>{daily_legend(bags)}{daily_svg(bags, settings)}</div>
+{charts}
 <div class=card><h2>Use these first</h2>{table}</div>
 </html>"""
     path = home() / "report.html"
@@ -841,7 +979,8 @@ def menu():
         cmd_status()
         print("  1 Add milk      2 Use a bag     3 Donate extra")
         print("  4 See bags      5 Open report   6 Settings")
-        print("  7 Match to a baby's age         q Quit")
+        print("  7 Match to a baby's age         8 Log a bulk donation")
+        print("  q Quit")
         choice = input("\nWhat would you like to do? ").strip().lower()
         try:
             if choice == "1":
@@ -868,6 +1007,12 @@ def menu():
             elif choice == "7":
                 raw = ask("Baby's age in days (Enter for your baby's age today)")
                 cmd_match(ns(age=int(raw) if raw else None, within=14, limit=10))
+            elif choice == "8":
+                print("For milk donated without bag details. "
+                      "Your freezer stash won't change.")
+                cmd_bulk(ns(amount=ask("Total amount donated"), remove=None,
+                            date=ask("Date donated (or unknown)", "today"),
+                            note=ask("Note, like who helped (optional)")))
             elif choice in ("q", "quit", "exit"):
                 return
         except ValueError as error:
@@ -911,6 +1056,13 @@ def build_parser():
     p.add_argument("--yes", action="store_true", help="skip the confirmation")
     p.set_defaults(func=cmd_donate)
 
+    p = sub.add_parser("bulk", help="log a donation not tied to specific bags")
+    p.add_argument("amount", nargs="?", help="total donated; leave out to list them")
+    p.add_argument("--date", default="today", help="date donated, or 'unknown'")
+    p.add_argument("--note", default="")
+    p.add_argument("--remove", type=int, metavar="NUMBER")
+    p.set_defaults(func=cmd_bulk)
+
     p = sub.add_parser("toss", help="mark bags thrown away")
     p.add_argument("ids", nargs="+", type=int)
     p.add_argument("--date", default="today")
@@ -944,6 +1096,8 @@ def build_parser():
                    help="add to the bags you already have")
     p.add_argument("--replace", action="store_true",
                    help="update your stash from this file, keeping a backup")
+    p.add_argument("--bulk", action="store_true",
+                   help="this file lists bulk donations, not individual bags")
     p.set_defaults(func=cmd_import)
 
     sub.add_parser("demo", help="try it with made-up data").set_defaults(func=cmd_demo)
