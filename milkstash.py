@@ -14,6 +14,7 @@ import calendar
 import csv
 import html
 import json
+import math
 import os
 import random
 import re
@@ -31,6 +32,7 @@ DEFAULTS = {
     "target_days": 90,       # how many days of milk to keep
     "freezer_months": 6,     # how long a bag is good for
     "warn_days": 30,         # warn when a bag is this close to its use-by date
+    "birth_date": None,      # optional: charts can count days since delivery
 }
 
 
@@ -63,7 +65,7 @@ def atomic_write(path, write):
 
 def save_settings(settings):
     for key, value in settings.items():
-        if key != "unit" and value <= 0:
+        if isinstance(value, (int, float)) and value <= 0:
             raise ValueError(f"{key.replace('_', ' ')} must be more than zero.")
     atomic_write(home() / "settings.json",
                  lambda f: json.dump(settings, f, indent=2))
@@ -127,6 +129,16 @@ def parse_volume(text, unit):
         raise ValueError(f"I couldn't read the amount '{text}'. Try 5 or 150ml.")
     amount = float(match.group(1))
     return amount * ML_PER_OZ if (match.group(2) or unit) == "oz" else amount
+
+
+def parse_birth_date(text):
+    """Turn a typed birthday into a stored date. Blank or 'none' clears it."""
+    if not text or text.strip().lower() == "none":
+        return None
+    birth = parse_date(text)
+    if birth > date.today():
+        raise ValueError("The birthday can't be in the future.")
+    return birth.isoformat()
 
 
 def add_months(day, months):
@@ -372,7 +384,8 @@ def cmd_settings(args):
     for key in DEFAULTS:
         value = getattr(args, key, None)
         if value is not None:
-            settings[key] = value
+            settings[key] = (parse_birth_date(value) if key == "birth_date"
+                             else value)
             changed = True
     if changed:
         save_settings(settings)
@@ -383,6 +396,8 @@ def cmd_settings(args):
           f"({fmt(target_ml(settings), settings)})")
     print(f"  Freezer life    {settings['freezer_months']} months")
     print(f"  Warn me         {settings['warn_days']} days before expiry")
+    birth = settings.get("birth_date")
+    print(f"  Baby's birthday {nice(date.fromisoformat(birth)) if birth else 'not set'}")
 
 
 def cmd_import(args):
@@ -449,21 +464,76 @@ def history(bags, settings):
     for day in sorted(changes):
         level += changes[day]
         points.append((day, max(level, 0.0)))
-    if points and points[-1][0] < date.today():
+    if points and points[-1][0] < date.today() and points[-1][1] > 0.01:
         points.append((date.today(), points[-1][1]))
     return points
 
 
+CHART_W, CHART_H, CHART_L, CHART_R, CHART_T, CHART_B = 760, 300, 62, 28, 12, 50
+AVERAGE_DAYS = 4
+
+
+def nice_ticks(low, high, count=5):
+    raw = max(high - low, 1) / count
+    magnitude = 10 ** math.floor(math.log10(raw))
+    step = next(m * magnitude for m in (1, 2, 2.5, 5, 10) if m * magnitude >= raw)
+    return [i * step for i in range(math.floor(low / step),
+                                    math.ceil(high / step) + 1)]
+
+
+def time_ticks(start, end, settings):
+    """Tick marks along the bottom: days since delivery, or calendar months."""
+    birth = settings.get("birth_date")
+    if birth:
+        birth = date.fromisoformat(birth)
+        first, last = (start - birth).days, (end - birth).days
+        step = 30 * max(1, math.ceil((last - first) / 240))
+        ticks = [(birth + timedelta(days=n * step), str(n * step))
+                 for n in range(math.ceil(first / step), last // step + 1)]
+        return ticks, "Days since delivery"
+    months = (end.year - start.year) * 12 + end.month - start.month
+    step = max(1, math.ceil(months / 6))
+    ticks = []
+    for n in range(1, months + 1, step):
+        day = add_months(start.replace(day=1), n)
+        ticks.append((day, f"{calendar.month_abbr[day.month]} {day.year}"))
+    return ticks, "Date"
+
+
+def scales(start, end, low, high):
+    span = max((end - start).days, 1)
+    x = lambda d: CHART_L + (CHART_W - CHART_L - CHART_R) * (d - start).days / span
+    y = lambda v: CHART_T + (CHART_H - CHART_B - CHART_T) * (high - v) / (high - low)
+    return x, y
+
+
+def axes(x, y, value_ticks, start, end, settings):
+    right = CHART_W - CHART_R
+    parts = [
+        f'<line x1="{CHART_L}" x2="{right}" y1="{y(v):.1f}" y2="{y(v):.1f}" '
+        f'class="{"zero" if v == 0 else "grid"}"/>'
+        f'<text x="{CHART_L - 8}" y="{y(v) + 4:.1f}" text-anchor="end">{v:,.0f}</text>'
+        for v in value_ticks]
+    ticks, title = time_ticks(start, end, settings)
+    baseline = CHART_H - CHART_B + 18
+    parts += [f'<text x="{x(d):.1f}" y="{baseline}" text-anchor="middle">{label}</text>'
+              for d, label in ticks]
+    parts.append(f'<text x="{(CHART_L + right) / 2}" y="{CHART_H - 6}" '
+                 f'text-anchor="middle">{title}</text>')
+    return "".join(parts)
+
+
+def unit_size(settings):
+    return 1 if settings["unit"] == "ml" else ML_PER_OZ
+
+
 def chart_svg(points, settings):
-    width, height, left, bottom = 760, 300, 62, 34
-    divisor = 1 if settings["unit"] == "ml" else ML_PER_OZ
+    divisor = unit_size(settings)
     goal = target_ml(settings) / divisor
     values = [(d, v / divisor) for d, v in points]
-    top = max([v for _, v in values] + [goal]) * 1.1
+    ticks = nice_ticks(0, max([v for _, v in values] + [goal]) * 1.05)
     start, end = values[0][0], values[-1][0]
-    span = max((end - start).days, 1)
-    x = lambda d: left + (width - left - 12) * (d - start).days / span
-    y = lambda v: 12 + (height - bottom - 12) * (1 - v / top)
+    x, y = scales(start, end, ticks[0], ticks[-1])
     path = []
     previous = None
     for day, value in values:
@@ -471,22 +541,73 @@ def chart_svg(points, settings):
             path.append(f"{x(day):.1f},{y(previous):.1f}")
         path.append(f"{x(day):.1f},{y(value):.1f}")
         previous = value
-    grid = "".join(
-        f'<line x1="{left}" x2="{width - 12}" y1="{y(top * i / 4):.1f}" '
-        f'y2="{y(top * i / 4):.1f}" class="grid"/>'
-        f'<text x="{left - 8}" y="{y(top * i / 4) + 4:.1f}" text-anchor="end">'
-        f'{top * i / 4:,.0f}</text>' for i in range(5))
     return (
-        f'<svg viewBox="0 0 {width} {height}" role="img" '
-        f'aria-label="Stash size over time compared with your goal">{grid}'
-        f'<line x1="{left}" x2="{width - 12}" y1="{y(goal):.1f}" '
+        f'<svg viewBox="0 0 {CHART_W} {CHART_H}" role="img" '
+        f'aria-label="Stash size over time compared with your goal">'
+        f'{axes(x, y, ticks, start, end, settings)}'
+        f'<line x1="{CHART_L}" x2="{CHART_W - CHART_R}" y1="{y(goal):.1f}" '
         f'y2="{y(goal):.1f}" class="goal"/>'
-        f'<text x="{width - 14}" y="{y(goal) - 6:.1f}" text-anchor="end" '
-        f'class="goaltext">Goal</text>'
-        f'<polyline points="{" ".join(path)}" class="line"/>'
-        f'<text x="{left}" y="{height - 10}">{nice(start)}</text>'
-        f'<text x="{width - 12}" y="{height - 10}" text-anchor="end">'
-        f'{nice(end)}</text></svg>')
+        f'<text x="{CHART_L + 4}" y="{y(goal) - 6:.1f}" class="goaltext">Goal</text>'
+        f'<polyline points="{" ".join(path)}" class="line"/></svg>')
+
+
+def daily_totals(bags):
+    totals = {}
+    for bag in bags:
+        day = totals.setdefault(bag["pumped"], {})
+        day["pumped"] = day.get("pumped", 0) + bag["volume_ml"]
+        if bag["status"] != "stored" and bag["status_date"]:
+            day = totals.setdefault(bag["status_date"], {})
+            day[bag["status"]] = day.get(bag["status"], 0) + bag["volume_ml"]
+    return totals
+
+
+def daily_svg(bags, settings):
+    """Bars for milk in (up) and out (down), with a rolling average of pumping."""
+    divisor = unit_size(settings)
+    totals = daily_totals(bags)
+    start, end = min(totals), max(max(totals), history(bags, settings)[-1][0])
+    days = [start + timedelta(days=n) for n in range((end - start).days + 1)]
+    outgoing = ("used", "donated", "discarded")
+    high = max(t.get("pumped", 0) for t in totals.values()) / divisor
+    low = -max(sum(t.get(k, 0) for k in outgoing) for t in totals.values()) / divisor
+    ticks = nice_ticks(low, high)
+    x, y = scales(start, end, ticks[0], ticks[-1])
+    bar = min(24.0, max(1.0, (CHART_W - CHART_L - CHART_R) / len(days) * 0.85))
+    rects = []
+    for day, amounts in totals.items():
+        left = x(day) - bar / 2
+        pumped = amounts.get("pumped", 0) / divisor
+        if pumped:
+            rects.append(f'<rect x="{left:.1f}" y="{y(pumped):.1f}" width="{bar:.1f}" '
+                         f'height="{y(0) - y(pumped):.1f}" class="pumped"/>')
+        depth = 0.0
+        for kind in outgoing:
+            amount = amounts.get(kind, 0) / divisor
+            if amount:
+                rects.append(f'<rect x="{left:.1f}" y="{y(-depth):.1f}" width="{bar:.1f}" '
+                             f'height="{y(-depth - amount) - y(-depth):.1f}" class="{kind}"/>')
+                depth += amount
+    pumped_by_day = [totals.get(d, {}).get("pumped", 0) / divisor for d in days]
+    average = []
+    for i in range(AVERAGE_DAYS - 1, len(days)):
+        level = sum(pumped_by_day[i - AVERAGE_DAYS + 1:i + 1]) / AVERAGE_DAYS
+        average.append(f"{x(days[i]):.1f},{y(level):.1f}")
+    line = f'<polyline points="{" ".join(average)}" class="avg"/>' if average else ""
+    return (
+        f'<svg viewBox="0 0 {CHART_W} {CHART_H}" role="img" aria-label="Milk pumped, '
+        f'used, donated, and discarded each day, with a {AVERAGE_DAYS}-day average">'
+        f'{axes(x, y, ticks, start, end, settings)}{"".join(rects)}{line}</svg>')
+
+
+def daily_legend(bags):
+    present = {k for t in daily_totals(bags).values() for k in t}
+    names = [("pumped", "Pumped"), ("used", "Used"), ("donated", "Donated"),
+             ("discarded", "Tossed")]
+    items = [f'<span><i class="{k}"></i>{label}</span>'
+             for k, label in names if k in present]
+    items.append(f'<span><i class="avgkey"></i>{AVERAGE_DAYS}-day average pumped</span>')
+    return f'<div class=legend>{"".join(items)}</div>'
 
 
 def cmd_report(args):
@@ -502,6 +623,9 @@ def cmd_report(args):
         f"<td>{fmt(b['volume_ml'], settings)}</td>"
         f"<td>{nice(use_by(b, settings))}</td>"
         f"<td>{html.escape(b['notes'])}</td></tr>" for b in good[:10])
+    table = ("<table><tr><th>Bag<th>Pumped<th>Amount<th>Use by<th>Notes</tr>"
+             f"{rows}</table>" if rows else
+             "<p>There are no in-date bags in the freezer right now.</p>")
     tiles = [("In the freezer", fmt(total, settings)),
              ("Days of milk", f"{total / daily_ml(settings):.0f}"),
              ("Ready to donate", fmt(sum(b["volume_ml"] for b in plan), settings)),
@@ -511,19 +635,24 @@ def cmd_report(args):
     page = f"""<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Milk Stash</title><style>
-:root{{--bg:#fffaf5;--card:#fff;--ink:#3b3330;--soft:#7d716b;--line:#eadfd6;--main:#c8693f;--goal:#44707f}}
-@media(prefers-color-scheme:dark){{:root{{--bg:#211d1b;--card:#2c2724;--ink:#f3ebe5;--soft:#b5a9a2;--line:#463e39;--main:#ee9b72;--goal:#8cc0d1}}}}
+:root{{--bg:#fffaf5;--card:#fff;--ink:#3b3330;--soft:#7d716b;--line:#eadfd6;--main:#c8693f;--goal:#44707f;--pumped:#eeb896;--used:#d19a12;--donated:#7c58a6;--tossed:#8f8580}}
+@media(prefers-color-scheme:dark){{:root{{--bg:#211d1b;--card:#2c2724;--ink:#f3ebe5;--soft:#b5a9a2;--line:#463e39;--main:#ee9b72;--goal:#8cc0d1;--pumped:#9a6245;--used:#e8c35a;--donated:#b795dc;--tossed:#a59b95}}}}
 body{{margin:0 auto;max-width:800px;padding:24px 16px;background:var(--bg);color:var(--ink);font:16px system-ui,sans-serif}}
 .tiles{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}}
 .tile,.card{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}}
 .tile b{{display:block;font-size:22px}}.tile span{{color:var(--soft);font-size:14px}}
 .card{{margin-top:14px;overflow-x:auto}}svg{{width:100%;height:auto}}svg text{{fill:var(--soft);font-size:12px}}
 .grid{{stroke:var(--line)}}.goal{{stroke:var(--goal);stroke-width:2;stroke-dasharray:6 5}}svg .goaltext{{fill:var(--goal);font-weight:600}}
-.line{{fill:none;stroke:var(--main);stroke-width:2.5}}table{{border-collapse:collapse;width:100%}}
+.line{{fill:none;stroke:var(--main);stroke-width:2.5}}.zero{{stroke:var(--soft)}}.avg{{fill:none;stroke:var(--ink);stroke-width:2}}
+rect.pumped{{fill:var(--pumped)}}rect.used{{fill:var(--used)}}rect.donated{{fill:var(--donated)}}rect.discarded{{fill:var(--tossed)}}
+.legend{{display:flex;flex-wrap:wrap;gap:6px 16px;margin-bottom:8px;color:var(--soft);font-size:14px}}.legend span{{display:inline-flex;align-items:center;gap:6px}}
+.legend i{{width:12px;height:12px;border-radius:3px}}i.pumped{{background:var(--pumped)}}i.used{{background:var(--used)}}i.donated{{background:var(--donated)}}i.discarded{{background:var(--tossed)}}.legend i.avgkey{{height:2px;width:18px;border-radius:0;background:var(--ink)}}
+table{{border-collapse:collapse;width:100%}}
 td,th{{padding:6px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}}h2{{font-size:17px;margin:0 0 10px}}
 </style><h1>Milk Stash</h1><div class=tiles>{tile_html}</div>
-<div class=card><h2>Stash over time</h2>{chart_svg(history(bags, settings), settings)}</div>
-<div class=card><h2>Use these first</h2><table><tr><th>Bag<th>Pumped<th>Amount<th>Use by<th>Notes</tr>{rows}</table></div>
+<div class=card><h2>Stash over time ({settings['unit']})</h2>{chart_svg(history(bags, settings), settings)}</div>
+<div class=card><h2>Daily milk ({settings['unit']})</h2>{daily_legend(bags)}{daily_svg(bags, settings)}</div>
+<div class=card><h2>Use these first</h2>{table}</div>
 </html>"""
     path = home() / "report.html"
     atomic_write(path, lambda f: f.write(page))
@@ -564,13 +693,15 @@ def ask_ids(prompt):
 
 
 def first_run():
-    print("\nWelcome to Milk Stash! Three quick questions. Press Enter to "
+    print("\nWelcome to Milk Stash! A few quick questions. Press Enter to "
           "accept the suggestion in [brackets].\n")
     settings = dict(DEFAULTS)
     unit = ask("Do you measure in oz or ml?", "oz").lower()
     settings["unit"] = "ml" if unit.startswith("m") else "oz"
     settings["daily_oz"] = float(ask("How many oz does baby drink a day?", "24"))
     settings["target_days"] = int(ask("How many days of milk do you want to keep?", "90"))
+    settings["birth_date"] = parse_birth_date(
+        ask("Baby's birthday, for charts (optional, Enter to skip)"))
     save_settings(settings)
     print("\nAll set. You can change these any time.\n")
 
@@ -603,6 +734,8 @@ def menu():
                 current["daily_oz"] = float(ask("Oz per day", f"{current['daily_oz']:g}"))
                 current["target_days"] = int(ask("Days to keep", str(current["target_days"])))
                 current["freezer_months"] = int(ask("Freezer months", str(current["freezer_months"])))
+                current["birth_date"] = parse_birth_date(
+                    ask("Baby's birthday (or none)", current.get("birth_date") or "none"))
                 save_settings(current)
             elif choice in ("q", "quit", "exit"):
                 return
@@ -663,6 +796,8 @@ def build_parser():
     p.add_argument("--target-days", dest="target_days", type=int)
     p.add_argument("--freezer-months", dest="freezer_months", type=int)
     p.add_argument("--warn-days", dest="warn_days", type=int)
+    p.add_argument("--birth-date", dest="birth_date",
+                   help="baby's birthday, or 'none' to clear it")
     p.set_defaults(func=cmd_settings)
 
     p = sub.add_parser("import", help="bring in bags from a CSV file")

@@ -20,7 +20,7 @@ It's one file with nothing to install beyond Python. Your data stays on your com
 python3 milkstash.py
 ```
 
-The first time, it asks three quick questions and then shows a simple menu:
+The first time, it asks a few quick questions and then shows a simple menu:
 
 ```
 Your milk stash
@@ -60,11 +60,18 @@ Each new bag gets a number. Write it on the bag so you can find it later.
 
 Run `python3 milkstash.py report` to open a page with your numbers and chart. This example uses made-up data:
 
-![Sample Milk Stash report with summary numbers, a chart of the stash over time against a 90-day goal, and a list of the bags to use first](docs/report.png)
+![Sample Milk Stash report with summary numbers, a chart of the stash over time against a 90-day goal, a daily milk chart with a 4-day average, and a list of the bags to use first](docs/report.png)
 
 - **Summary numbers** show what's in the freezer, how many days it will last, how much is ready to donate, and how much you've donated so far.
 - **Stash over time** tracks your supply against your goal, shown as the dashed line. Each sharp drop in this example is a donation that brings the stash back down to the goal.
+- **Daily milk** shows what you pumped each day above the line and what was used, donated, or tossed below it. The dark line is your 4-day pumping average, which makes trends easier to see.
 - **Use these first** lists the 10 oldest in-date bags with their bag numbers and use-by dates.
+
+Add your baby's birthday to count both charts in days since delivery. Without it, they show calendar months:
+
+```
+python3 milkstash.py settings --birth-date 3/14/2026
+```
 
 The report is saved on your computer and works in light or dark mode.
 
@@ -81,6 +88,7 @@ python3 milkstash.py settings --target-days 60 --daily-oz 20
 | `--freezer-months` | 6 | How long a frozen bag is good for |
 | `--warn-days` | 30 | How early to warn about expiring bags |
 | `--unit` | oz | Show amounts in `oz` or `ml` |
+| `--birth-date` | not set | Baby's birthday, used for days since delivery on charts |
 
 ## How donation suggestions work
 
@@ -94,7 +102,7 @@ Export it as a CSV and run:
 python3 milkstash.py import my-log.csv
 ```
 
-The file needs a `Date` column and a `Volume (ml)` or `Volume (oz)` column. Optional columns are `Name`, `Used`, `Donated`, `Donation date`, and `Special notes`.
+The file needs a `Date` column and a `Volume (ml)` or `Volume (oz)` column. Optional columns are `Name`, `Used`, `Donated`, `Donation date`, and `Special notes`. Spreadsheets rarely record when a bag was used, so imported used bags are counted on the day they were pumped.
 
 ## Where your data lives
 
